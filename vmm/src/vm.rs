@@ -3036,6 +3036,10 @@ impl Vm {
             .memory_range_table(false)
     }
 
+    pub fn mapping_range_table(&self) -> MemoryRangeTable {
+        self.memory_manager.lock().unwrap().mapping_range_table()
+    }
+
     pub fn set_diff_snapshot_ranges(&mut self, table: MemoryRangeTable) {
         self.memory_manager
             .lock()

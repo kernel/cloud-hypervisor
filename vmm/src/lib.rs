@@ -1971,7 +1971,7 @@ impl Vmm {
                 )?;
 
                 let snapshot_series_layout = if track_dirty_pages {
-                    let layout = vm.memory_range_table().map_err(VmError::Restore)?;
+                    let layout = vm.mapping_range_table();
                     // Arm tracking before restore starts vCPUs or activates devices so
                     // restore-side writes are included in the later delta.
                     vm.start_dirty_log().map_err(VmError::Restore)?;
@@ -2349,7 +2349,7 @@ impl RequestHandler for Vmm {
                 let effective_diff = requested_diff && self.snapshot_series_layout.is_some();
 
                 if requested_diff {
-                    let layout = vm.memory_range_table().map_err(VmError::Snapshot)?;
+                    let layout = vm.mapping_range_table();
                     if let Some(baseline) = &self.snapshot_series_layout {
                         if !same_memory_layout(baseline, &layout) {
                             self.snapshot_series_layout = None;
