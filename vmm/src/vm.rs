@@ -3036,6 +3036,13 @@ impl Vm {
             .memory_range_table(false)
     }
 
+    pub fn set_diff_snapshot_ranges(&mut self, table: MemoryRangeTable) {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .set_diff_snapshot_ranges(table);
+    }
+
     pub fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
         self.memory_manager.lock().unwrap().guest_memory()
     }

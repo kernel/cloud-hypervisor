@@ -49,7 +49,7 @@ use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::api::{
     ApiRequest, ApiResponse, MigrationMode, RequestHandler, TimeoutStrategy, VmInfoResponse,
-    VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
+    VmReceiveMigrationData, VmSendMigrationData, VmSnapshotConfig, VmSnapshotType, VmmPingResponse,
 };
 use crate::config::{MemoryRestoreMode, RestoreConfig, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -690,6 +690,16 @@ pub struct Vmm {
     console_info: Option<ConsoleInfo>,
     no_shutdown: bool,
     check_migration_evt: EventFd,
+    // Memory layout at diff-snapshot series start; Some means dirty logging is active.
+    snapshot_series_layout: Option<MemoryRangeTable>,
+}
+
+fn same_memory_layout(a: &MemoryRangeTable, b: &MemoryRangeTable) -> bool {
+    a.regions().len() == b.regions().len()
+        && a.regions()
+            .iter()
+            .zip(b.regions())
+            .all(|(x, y)| x.gpa == y.gpa && x.length == y.length)
 }
 
 /// Time before aborting on the page fault connection.
@@ -919,6 +929,7 @@ impl Vmm {
             console_info: None,
             no_shutdown,
             check_migration_evt,
+            snapshot_series_layout: None,
         })
     }
 
@@ -1904,6 +1915,7 @@ impl Vmm {
         vm_config: Arc<Mutex<VmConfig>>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
+        track_dirty_pages: bool,
     ) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
@@ -1958,6 +1970,16 @@ impl Vmm {
                     Some(memory_restore_mode),
                 )?;
 
+                let snapshot_series_layout = if track_dirty_pages {
+                    let layout = vm.memory_range_table().map_err(VmError::Restore)?;
+                    // Arm tracking before restore starts vCPUs or activates devices so
+                    // restore-side writes are included in the later delta.
+                    vm.start_dirty_log().map_err(VmError::Restore)?;
+                    Some(layout)
+                } else {
+                    None
+                };
+
                 if self
                     .vm_config
                     .as_ref()
@@ -1973,6 +1995,7 @@ impl Vmm {
                 // Now we can restore the rest of the VM.
                 // PANIC: won't panic, we just checked that the VM is there.
                 vm.restore()?;
+                self.snapshot_series_layout = snapshot_series_layout;
                 self.vm = VmOwnership::Owned(vm);
                 Ok(())
             }
@@ -2315,20 +2338,53 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
+    fn vm_snapshot(&mut self, config: &VmSnapshotConfig) -> result::Result<(), VmError> {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 if vm.restoring() {
                     return Err(VmError::VmRestoring);
                 }
+
+                let requested_diff = config.snapshot_type == VmSnapshotType::Diff;
+                let effective_diff = requested_diff && self.snapshot_series_layout.is_some();
+
+                if requested_diff {
+                    let layout = vm.memory_range_table().map_err(VmError::Snapshot)?;
+                    if let Some(baseline) = &self.snapshot_series_layout {
+                        if !same_memory_layout(baseline, &layout) {
+                            self.snapshot_series_layout = None;
+                            let _ = vm.stop_dirty_log();
+                            return Err(VmError::Snapshot(MigratableError::Snapshot(anyhow!(
+                                "memory layout changed since dirty tracking started"
+                            ))));
+                        }
+                    } else {
+                        vm.start_dirty_log().map_err(VmError::Snapshot)?;
+                        self.snapshot_series_layout = Some(layout);
+                    }
+                } else if self.snapshot_series_layout.take().is_some() {
+                    vm.stop_dirty_log().map_err(VmError::Snapshot)?;
+                }
+
                 // Drain console_info so that FDs are not reused
                 let _ = self.console_info.take();
-                vm.snapshot()
+                let result = vm
+                    .snapshot()
                     .map_err(VmError::Snapshot)
                     .and_then(|snapshot| {
-                        vm.send(&snapshot, destination_url)
+                        if effective_diff {
+                            // Capture pages dirtied while snapshotting devices too.
+                            let dirty = vm.dirty_log().map_err(VmError::Snapshot)?;
+                            vm.set_diff_snapshot_ranges(dirty);
+                        }
+                        vm.send(&snapshot, &config.destination_url)
                             .map_err(VmError::SnapshotSend)
-                    })
+                    });
+
+                if result.is_err() && self.snapshot_series_layout.take().is_some() {
+                    let _ = vm.stop_dirty_log();
+                }
+                result
             }
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => Err(VmError::VmNotRunning),
@@ -2340,6 +2396,7 @@ impl RequestHandler for Vmm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => {
+                self.snapshot_series_layout = None;
                 if self.vm_config.is_some() {
                     return Err(VmError::VmAlreadyCreated);
                 }
@@ -2379,6 +2436,7 @@ impl RequestHandler for Vmm {
                     vm_config,
                     restore_cfg.prefault,
                     restore_cfg.memory_restore_mode,
+                    restore_cfg.track_dirty_pages,
                 )
                 .and_then(|()| {
                     if restore_cfg.resume {
@@ -2412,6 +2470,7 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_shutdown(&mut self) -> result::Result<(), VmError> {
+        self.snapshot_series_layout = None;
         let mut vm = self.vm.take_owned_or(VmError::VmNotRunning)?;
         // Drain console_info so that the FDs are not reused
         let _ = self.console_info.take();
@@ -2426,6 +2485,7 @@ impl RequestHandler for Vmm {
 
     fn vm_reboot(&mut self) -> result::Result<(), VmError> {
         event!("vm", "rebooting");
+        self.snapshot_series_layout = None;
 
         // Drop VM early to release disk locks and free other resources before
         // we reboot.
@@ -2551,6 +2611,7 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_delete(&mut self) -> result::Result<(), VmError> {
+        self.snapshot_series_layout = None;
         if self.vm_config.is_none() {
             return Ok(());
         }
@@ -3200,6 +3261,7 @@ impl RequestHandler for Vmm {
 
         // Take VM ownership. This also means that API events can no longer
         // change the VM (e.g. net device hotplug).
+        self.snapshot_series_layout = None;
         let vm = self
             .vm
             .take_owned_or(VmError::VmNotRunning)
