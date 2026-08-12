@@ -810,9 +810,13 @@ impl Mem {
             (avail_features, 0, config, false)
         };
 
-        let host_fd = region
-            .file_offset()
-            .map(|f_offset| f_offset.file().as_raw_fd());
+        let host_fd = if region.flags() & libc::MAP_SHARED == libc::MAP_SHARED {
+            region
+                .file_offset()
+                .map(|f_offset| f_offset.file().as_raw_fd())
+        } else {
+            None
+        };
 
         Ok(Mem {
             common: VirtioCommon {

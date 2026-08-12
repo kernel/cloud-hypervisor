@@ -1,5 +1,11 @@
 name: Cloud Hypervisor Release
-on: [create, merge_group]
+on:
+  push:
+    tags:
+      - "v*-kernel.*"
+  merge_group:
+permissions:
+  contents: write
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
@@ -8,7 +14,7 @@ env:
 
 jobs:
   release:
-    if: (github.event_name == 'create' && github.event.ref_type == 'tag') || github.event_name == 'merge_group'
+    if: github.event_name == 'push' || github.event_name == 'merge_group'
     name: Release ${{ matrix.platform.target }}
     strategy:
       fail-fast: false
@@ -35,9 +41,9 @@ jobs:
         run: sudo apt install -y musl-tools
       - name: Create release directory
         if: |
-          github.event_name == 'create' && github.event.ref_type == 'tag' &&
+          github.event_name == 'push' &&
           matrix.platform.target == 'x86_64-unknown-linux-gnu'
-        run: rsync -rv --exclude=.git . ../cloud-hypervisor-${{ github.event.ref }}
+        run: rsync -rv --exclude=.git . ../cloud-hypervisor-${{ github.ref_name }}
       - name: Build ${{ matrix.platform.target }}
         uses: houseabsolute/actions-rust-cross@v1
         with:
@@ -47,13 +53,13 @@ jobs:
           strip: true
           toolchain: "1.89.0"
       - name: Copy Release Binaries
-        if: github.event_name == 'create' && github.event.ref_type == 'tag'
+        if: github.event_name == 'push'
         shell: bash
         run: |
           cp target/${{ matrix.platform.target }}/release/cloud-hypervisor ./${{ matrix.platform.name_ch }}
           cp target/${{ matrix.platform.target }}/release/ch-remote ./${{ matrix.platform.name_ch_remote }}
       - name: Upload Release Artifacts
-        if: github.event_name == 'create' && github.event.ref_type == 'tag'
+        if: github.event_name == 'push'
         uses: actions/upload-artifact@v7
         with:
           name: Artifacts for ${{ matrix.platform.target }}
@@ -62,9 +68,9 @@ jobs:
             ./${{ matrix.platform.name_ch_remote }}
       - name: Vendor
         if: |
-          github.event_name == 'create' && github.event.ref_type == 'tag' &&
+          github.event_name == 'push' &&
           matrix.platform.target == 'x86_64-unknown-linux-gnu'
-        working-directory: ../cloud-hypervisor-${{ github.event.ref }}
+        working-directory: ../cloud-hypervisor-${{ github.ref_name }}
         run: |
           mkdir ../vendor-cargo-home
           export CARGO_HOME=$(realpath ../vendor-cargo-home)
@@ -72,24 +78,24 @@ jobs:
           cargo vendor > .cargo/config.toml
       - name: Create vendored source archive
         if: |
-          github.event_name == 'create' && github.event.ref_type == 'tag' &&
+          github.event_name == 'push' &&
           matrix.platform.target == 'x86_64-unknown-linux-gnu'
-        run: tar cJf cloud-hypervisor-${{ github.event.ref }}.tar.xz ../cloud-hypervisor-${{ github.event.ref }}
+        run: tar cJf cloud-hypervisor-${{ github.ref_name }}.tar.xz ../cloud-hypervisor-${{ github.ref_name }}
       - name: Upload cloud-hypervisor vendored source archive
         if: |
-          github.event_name == 'create' && github.event.ref_type == 'tag' &&
+          github.event_name == 'push' &&
           matrix.platform.target == 'x86_64-unknown-linux-gnu'
         id: upload-release-cloud-hypervisor-vendored-sources
         uses: actions/upload-artifact@v7
         with:
-          path: cloud-hypervisor-${{ github.event.ref }}.tar.xz
-          name: cloud-hypervisor-${{ github.event.ref }}.tar.xz
+          path: cloud-hypervisor-${{ github.ref_name }}.tar.xz
+          name: cloud-hypervisor-${{ github.ref_name }}.tar.xz
       - name: Create GitHub Release
-        if: github.event_name == 'create' && github.event.ref_type == 'tag'
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v3
         with:
           draft: true
           files: |
             ./${{ matrix.platform.name_ch }}
             ./${{ matrix.platform.name_ch_remote }}
-            ./cloud-hypervisor-${{ github.event.ref }}.tar.xz
+            ./cloud-hypervisor-${{ github.ref_name }}.tar.xz

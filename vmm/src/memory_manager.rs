@@ -226,6 +226,9 @@ pub struct MemoryManager {
     thp: bool,
     user_provided_zones: bool,
     snapshot_memory_ranges: MemoryRangeTable,
+    snapshot_fixed_file_layout: bool,
+    // Dirty ranges written by the next snapshot transport as a sparse delta.
+    diff_snapshot_ranges: Option<MemoryRangeTable>,
     memory_zones: MemoryZones,
     log_dirty: bool, // Enable dirty logging for created RAM regions
     arch_mem_regions: Vec<ArchMemRegion>,
@@ -784,7 +787,9 @@ impl MemoryManager {
             for zone_config in zones_config {
                 if guest_ram_mapping.zone_id == zone_config.id {
                     let region = MemoryManager::create_ram_region(
-                        if guest_ram_mapping.virtio_mem {
+                        if guest_ram_mapping.virtio_mem
+                            && (zone_config.file.is_none() || zone_config.shared)
+                        {
                             &None
                         } else {
                             &zone_config.file
@@ -1738,8 +1743,16 @@ impl MemoryManager {
                             // will create ram region with `prefault` option in
                             // restore config rather than same option in zone
                             let region = MemoryManager::create_ram_region(
-                                &None,
-                                0,
+                                if zone.file.is_some() && !zone.shared {
+                                    &zone.file
+                                } else {
+                                    &None
+                                },
+                                if zone.file.is_some() && !zone.shared {
+                                    zone.size
+                                } else {
+                                    0
+                                },
                                 start_addr,
                                 hotplug_size as usize,
                                 prefault.unwrap_or(zone.prefault),
@@ -1835,6 +1848,9 @@ impl MemoryManager {
         let end_of_ram_area = start_of_device_area.unchecked_sub(1);
         let ram_allocator = AddressAllocator::new(GuestAddress(0), start_of_device_area.0).unwrap();
 
+        let snapshot_fixed_file_layout =
+            user_provided_zones && zones.len() == 1 && zones[0].file.is_some() && !zones[0].shared;
+
         #[allow(unused_mut)]
         let mut memory_manager = MemoryManager {
             boot_guest_memory,
@@ -1860,6 +1876,8 @@ impl MemoryManager {
             reserve: config.reserve,
             user_provided_zones,
             snapshot_memory_ranges: MemoryRangeTable::default(),
+            snapshot_fixed_file_layout,
+            diff_snapshot_ranges: None,
             memory_zones,
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
@@ -2683,6 +2701,17 @@ impl MemoryManager {
         &mut self.memory_zones
     }
 
+    pub fn mapping_range_table(&self) -> MemoryRangeTable {
+        let mut table = MemoryRangeTable::default();
+        for mapping in &self.guest_ram_mappings {
+            table.push(MemoryRange {
+                gpa: mapping.gpa,
+                length: mapping.size,
+            });
+        }
+        table
+    }
+
     pub fn memory_range_table(
         &self,
         snapshot: bool,
@@ -3194,12 +3223,97 @@ pub struct MemoryManagerSnapshotData {
     next_hotplug_slot: usize,
 }
 
+// Writing a little clean memory between nearby dirty ranges sharply reduces
+// sparse-file extent count and the metadata I/O needed to merge a delta.
+const DIFF_SNAPSHOT_COALESCE_GAP: u64 = 64 * 1024;
+
+fn push_diff_write_range(plan: &mut Vec<(u64, MemoryRange)>, file_offset: u64, range: MemoryRange) {
+    if let Some((last_file_offset, last)) = plan.last_mut() {
+        let last_end = last.gpa + last.length;
+        let range_end = range.gpa + range.length;
+        if range.gpa >= last_end
+            && range.gpa - last_end <= DIFF_SNAPSHOT_COALESCE_GAP
+            && file_offset == *last_file_offset + (range.gpa - last.gpa)
+        {
+            last.length = range_end - last.gpa;
+            return;
+        }
+    }
+    plan.push((file_offset, range));
+}
+
+#[cfg(test)]
+mod diff_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn dirty_write_plan_coalesces_nearby_ranges() {
+        let mut plan = Vec::new();
+        push_diff_write_range(
+            &mut plan,
+            0,
+            MemoryRange {
+                gpa: 0x1000,
+                length: 0x1000,
+            },
+        );
+        push_diff_write_range(
+            &mut plan,
+            0x4000,
+            MemoryRange {
+                gpa: 0x5000,
+                length: 0x1000,
+            },
+        );
+        push_diff_write_range(
+            &mut plan,
+            0x20000,
+            MemoryRange {
+                gpa: 0x21000,
+                length: 0x1000,
+            },
+        );
+
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].0, 0);
+        assert_eq!(plan[0].1.gpa, 0x1000);
+        assert_eq!(plan[0].1.length, 0x5000);
+    }
+}
+
+impl MemoryManager {
+    pub fn set_diff_snapshot_ranges(&mut self, table: MemoryRangeTable) {
+        self.diff_snapshot_ranges = Some(table);
+    }
+
+    fn snapshot_file_offset(&self, range: &MemoryRange) -> Option<u64> {
+        self.guest_ram_mappings.iter().find_map(|mapping| {
+            let mapping_end = mapping.gpa.checked_add(mapping.size)?;
+            let range_end = range.gpa.checked_add(range.length)?;
+            if range.gpa >= mapping.gpa && range_end <= mapping_end {
+                mapping.file_offset.checked_add(range.gpa - mapping.gpa)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn snapshot_file_len(&self) -> Option<u64> {
+        let mut max = 0;
+        for mapping in &self.guest_ram_mappings {
+            max = max.max(mapping.file_offset.checked_add(mapping.size)?);
+        }
+        Some(max)
+    }
+}
+
 impl Snapshottable for MemoryManager {
     fn id(&self) -> String {
         MEMORY_MANAGER_SNAPSHOT_ID.to_string()
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
+        self.diff_snapshot_ranges = None;
         let memory_ranges = self.memory_range_table(true)?;
 
         // Store locally this list of ranges as it will be used through the
@@ -3229,7 +3343,11 @@ impl Transportable for MemoryManager {
         }
 
         let mut memory_file_path = url_to_path(destination_url)?;
-        memory_file_path.push(String::from(SNAPSHOT_FILENAME));
+        memory_file_path.push(if self.diff_snapshot_ranges.is_some() {
+            format!("{SNAPSHOT_FILENAME}.diff")
+        } else {
+            String::from(SNAPSHOT_FILENAME)
+        });
 
         let mut memory_file = OpenOptions::new()
             .read(true)
@@ -3239,26 +3357,70 @@ impl Transportable for MemoryManager {
             .with_context(|| format!("Error creating memory snapshot file {memory_file_path:?}"))
             .map_err(MigratableError::MigrateSend)?;
 
-        let total_len: u64 = self
-            .snapshot_memory_ranges
-            .regions()
-            .iter()
-            .map(|r| r.length)
-            .sum();
+        let total_len: u64 = if self.snapshot_fixed_file_layout {
+            self.snapshot_file_len().ok_or_else(|| {
+                MigratableError::MigrateSend(anyhow!("invalid fixed snapshot memory layout"))
+            })?
+        } else {
+            self.snapshot_memory_ranges
+                .regions()
+                .iter()
+                .map(|range| range.length)
+                .sum()
+        };
 
-        // Pre-size the file so per-region write_at lands at the dense-layout
-        // offset. On filesystems that support sparse files unwritten bytes
-        // become real holes; on others the kernel zero-fills the allocation,
-        // which is still byte-correct. If extending the file is not
-        // supported by the destination filesystem (some FUSE backends
-        // reject ftruncate-extend with EOPNOTSUPP), fall back to the dense
-        // write path which never writes past the growing EOF.
-        let sparse_layout = memory_file.set_len(total_len).is_ok();
+        // Diff and fixed-layout snapshots require the declared length so holes
+        // keep stable offsets. Full dense snapshots can fall back to growing
+        // the file through sequential writes.
+        let sparse_layout =
+            if self.diff_snapshot_ranges.is_some() || self.snapshot_fixed_file_layout {
+                memory_file
+                    .set_len(total_len)
+                    .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+                true
+            } else {
+                memory_file.set_len(total_len).is_ok()
+            };
+
+        let mut write_plan: Vec<(u64, MemoryRange)> = Vec::new();
+        let mut layout_cursor = 0u64;
+        for full in self.snapshot_memory_ranges.regions() {
+            let full_file_offset = if self.snapshot_fixed_file_layout {
+                self.snapshot_file_offset(full).ok_or_else(|| {
+                    MigratableError::MigrateSend(anyhow!(
+                        "snapshot range is outside the fixed memory layout"
+                    ))
+                })?
+            } else {
+                layout_cursor
+            };
+            match &self.diff_snapshot_ranges {
+                None => write_plan.push((full_file_offset, full.clone())),
+                Some(dirty) => {
+                    for range in dirty.regions() {
+                        let start = range.gpa.max(full.gpa);
+                        let end = (range.gpa + range.length).min(full.gpa + full.length);
+                        if start < end {
+                            push_diff_write_range(
+                                &mut write_plan,
+                                full_file_offset + (start - full.gpa),
+                                MemoryRange {
+                                    gpa: start,
+                                    length: end - start,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            layout_cursor += full.length;
+        }
+        if !self.snapshot_fixed_file_layout {
+            debug_assert_eq!(layout_cursor, total_len);
+        }
 
         let guest_memory = self.guest_memory.memory();
-        let mut file_cursor: u64 = 0;
-
-        for range in self.snapshot_memory_ranges.regions() {
+        for (file_cursor, range) in write_plan {
             let mut wrote_sparse = false;
             if sparse_layout
                 && let Some(region) = guest_memory.find_region(GuestAddress(range.gpa))
@@ -3309,11 +3471,8 @@ impl Transportable for MemoryManager {
                     }
                 }
             }
-
-            file_cursor += range.length;
         }
 
-        debug_assert_eq!(file_cursor, total_len);
         Ok(())
     }
 }
