@@ -208,7 +208,7 @@ impl VfioUserPciDevice {
                     let user_memory_region = UserMemoryRegion {
                         slot: self.memory_slot_allocator.next_memory_slot(),
                         start: mmio_region.start.0 + s.offset,
-                        mapping,
+                        mapping: mapping.into(),
                     };
 
                     // SAFETY: validity of len and host_addr guaranteed by hypervisor::mmap::MmapRegion
