@@ -8,6 +8,7 @@ use core::ffi::{c_int, c_void};
 use core::ptr::null_mut;
 use std::io::{self, Error, ErrorKind};
 use std::os::fd::{AsRawFd as _, BorrowedFd};
+use std::sync::Arc;
 
 use libc::size_t;
 use log::warn;
@@ -189,6 +190,49 @@ unsafe impl Send for MmapRegion {}
 // SAFETY: the caller is responsible for avoiding data races
 unsafe impl Sync for MmapRegion {}
 
+/// A bounded view that keeps its entire original mmap alive.
+#[derive(Clone)]
+pub(crate) struct MmapRegionSlice {
+    region: Arc<MmapRegion>,
+    offset: usize,
+    len: usize,
+}
+
+impl MmapRegionSlice {
+    pub(crate) fn new(region: Arc<MmapRegion>, offset: u64, len: u64) -> io::Result<Self> {
+        let invalid = || Error::new(ErrorKind::InvalidInput, "Slice exceeds mmap region");
+        let offset = usize::try_from(offset).map_err(|_| invalid())?;
+        let len = usize::try_from(len).map_err(|_| invalid())?;
+        if len == 0 || offset.checked_add(len).is_none_or(|end| end > region.len()) {
+            return Err(invalid());
+        }
+        Ok(Self {
+            region,
+            offset,
+            len,
+        })
+    }
+
+    pub(crate) fn addr(&self) -> *mut u8 {
+        self.region.addr().wrapping_add(self.offset)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl From<Arc<MmapRegion>> for MmapRegionSlice {
+    fn from(region: Arc<MmapRegion>) -> Self {
+        let len = region.len();
+        Self {
+            region,
+            offset: 0,
+            len,
+        }
+    }
+}
+
 impl MmapRegion {
     #[inline]
     pub(crate) fn addr(&self) -> *mut u8 {
@@ -252,6 +296,51 @@ mod tests {
         let aligned_addr = base_addr.next_multiple_of(alignment);
 
         tail_trim_range(base_addr, reserve, aligned_addr, len)
+    }
+
+    #[test]
+    fn slices_keep_the_full_mapping_alive_and_reject_invalid_bounds() {
+        use std::fs::OpenOptions;
+        use std::os::fd::AsFd;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/zero")
+            .unwrap();
+        let page_size = get_page_size();
+        let region = Arc::new(
+            MmapRegion::mmap(
+                page_size * 3,
+                libc::PROT_READ | libc::PROT_WRITE,
+                file.as_fd(),
+                0,
+                0,
+            )
+            .unwrap(),
+        );
+        for (offset, len) in [
+            (0, 0),
+            (page_size * 3, 1),
+            (page_size * 2, page_size * 2),
+            (u64::MAX, 1),
+        ] {
+            match MmapRegionSlice::new(Arc::clone(&region), offset, len) {
+                Err(error) => assert_eq!(error.kind(), ErrorKind::InvalidInput),
+                Ok(_) => panic!("invalid mmap slice accepted"),
+            }
+        }
+        let view = MmapRegionSlice::new(Arc::clone(&region), page_size, page_size).unwrap();
+        assert_eq!(view.addr(), region.addr().wrapping_add(page_size as usize));
+        assert_eq!(view.len(), page_size as usize);
+        let weak = Arc::downgrade(&region);
+        drop(region);
+        assert!(weak.upgrade().is_some());
+        let cloned = view.clone();
+        drop(view);
+        assert!(weak.upgrade().is_some());
+        drop(cloned);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

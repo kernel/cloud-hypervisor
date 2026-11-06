@@ -4,12 +4,12 @@
 //
 
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::os::fd::BorrowedFd;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier, Mutex};
-use std::{cmp, io, result};
+use std::{cmp, io, result, slice};
 
 use anyhow::{Context, anyhow};
 use base64::Engine;
@@ -59,7 +59,7 @@ use crate::configuration::{
     PCI_EXP_FLAGS_VERS_SHIFT, PCI_EXP_LNKCTL, PCI_EXP_LNKCTL2, PCI_EXP_TYPE_RC_END,
     PCI_EXT_CAP_ALIGN, PCI_EXT_CAP_NEXT_MASK, PCI_EXT_CAP_NEXT_SHIFT, PCIE_CONFIG_SPACE_SIZE,
 };
-use crate::mmap::MmapRegion;
+use crate::mmap::{MmapRegion, MmapRegionSlice};
 use crate::msi::{MSI_CONFIG_ID, MsiConfigState};
 use crate::msix::{MaybeMutInterruptSourceGroup, MsixConfigState};
 use crate::{
@@ -303,7 +303,7 @@ impl Interrupt {
 pub(crate) struct UserMemoryRegion {
     pub slot: u32,
     pub start: u64,
-    pub mapping: Arc<MmapRegion>,
+    pub(crate) mapping: MmapRegionSlice,
 }
 
 #[derive(Clone)]
@@ -357,7 +357,7 @@ unsafe impl MmioRegionRange for Vec<MmioRegion> {
     fn find_user_address(&self, guest_addr: u64, size: u64) -> Result<*mut u8, io::Error> {
         for region in self.iter() {
             for user_region in region.user_memory_regions.iter() {
-                let mapping: &MmapRegion = &user_region.mapping;
+                let mapping = &user_region.mapping;
                 let start: u64 = user_region.start;
                 let len: u64 = mapping.len().try_into().unwrap();
                 // See if the guest address is inside the region.
@@ -862,10 +862,8 @@ impl VfioCommon {
         let mut bars = Vec::new();
         let mut bar_id = VFIO_PCI_BAR0_REGION_INDEX;
 
-        // Going through all regular regions to compute the BAR size.
-        // We're not saving the BAR address to restore it, because we
-        // are going to allocate a guest address for each BAR and write
-        // that new address back.
+        // Preserve BAR values while probing their sizes, then synchronize the
+        // allocated guest addresses with the VFIO driver's configuration.
         while bar_id < VFIO_PCI_CONFIG_REGION_INDEX {
             let mut region_size: u64 = 0;
             let mut region_type = PciBarRegionType::Memory32BitRegion;
@@ -934,6 +932,7 @@ impl VfioCommon {
 
                 // And read back BAR value. The device will write zeros for bits it doesn't care about
                 let mut lower = self.vfio_wrapper.read_config_dword(bar_offset);
+                self.vfio_wrapper.write_config_dword(bar_offset, flags);
 
                 if io_bar {
                     // Mask flag bits (lowest 2 for I/O bars)
@@ -956,9 +955,12 @@ impl VfioCommon {
 
                     // Query size of upper BAR of 64-bit BAR
                     let upper_offset: u32 = PCI_CONFIG_BAR_OFFSET + (bar_id + 1) * 4;
+                    let original_upper = self.vfio_wrapper.read_config_dword(upper_offset);
                     self.vfio_wrapper
                         .write_config_dword(upper_offset, 0xffff_ffff);
                     let upper = self.vfio_wrapper.read_config_dword(upper_offset);
+                    self.vfio_wrapper
+                        .write_config_dword(upper_offset, original_upper);
 
                     let mut combined_size = (u64::from(upper) << 32) | u64::from(lower);
 
@@ -1040,6 +1042,22 @@ impl VfioCommon {
                     self.configuration.add_pci_bar(&bar).map_err(|e| {
                         PciDeviceError::IoRegistrationFailed(bar_addr.raw_value(), e)
                     })?;
+                }
+            }
+
+            if resources.is_none() {
+                let reg = if bar_id == VFIO_PCI_ROM_REGION_INDEX {
+                    PCI_ROM_EXP_BAR_INDEX
+                } else {
+                    PCI_CONFIG_BAR0_INDEX + bar_id as usize
+                };
+                self.vfio_wrapper
+                    .write_config_dword((reg * 4) as u32, self.configuration.read_reg(reg));
+                if region_type == PciBarRegionType::Memory64BitRegion {
+                    self.vfio_wrapper.write_config_dword(
+                        ((reg + 1) * 4) as u32,
+                        self.configuration.read_reg(reg + 1),
+                    );
                 }
             }
 
@@ -1633,15 +1651,16 @@ impl VfioCommon {
         offset: u64,
         data: &[u8],
     ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
-        // When the guest wants to write to a BAR, we trap it into
-        // our local configuration space. We're not reprogramming
-        // VFIO device.
+        // VFIO filters writes to physical BARs, while mediated devices may
+        // need guest BAR updates to translate their emulated MMIO accesses.
         if (PCI_CONFIG_BAR0_INDEX..PCI_CONFIG_BAR0_INDEX + BAR_NUMS).contains(&reg_idx)
             || reg_idx == PCI_ROM_EXP_BAR_INDEX
         {
-            // We keep our local cache updated with the BARs.
-            // We'll read it back from there when the guest is asking
-            // for BARs (see read_config_register()).
+            self.vfio_wrapper.write_config(
+                (reg_idx * PCI_CONFIG_REGISTER_SIZE) as u32 + offset as u32,
+                data,
+            );
+            // Reads still use the shadow BARs and their guest address masks.
             return (
                 self.configuration
                     .write_config_register(reg_idx, offset, data),
@@ -2133,95 +2152,80 @@ impl VfioPciDevice {
         self.iommu_attached
     }
 
+    fn sparse_areas_without_msix(
+        areas: &[VfioRegionSparseMmapArea],
+        region_index: u32,
+        msix: &MsixCap,
+    ) -> Result<Vec<VfioRegionSparseMmapArea>, VfioPciError> {
+        let mut areas = areas.to_vec();
+        for (bar, (offset, size)) in [
+            (msix.table_bir(), msix.table_range()),
+            (msix.pba_bir(), msix.pba_range()),
+        ] {
+            if bar != region_index {
+                continue;
+            }
+            let hole_start = align_page_size_down(offset);
+            let hole_end = align_page_size_up(offset + size);
+            let mut filtered = Vec::new();
+            for area in areas {
+                let end = area
+                    .offset
+                    .checked_add(area.size)
+                    .ok_or(VfioPciError::MmapArea)?;
+                if end <= hole_start || area.offset >= hole_end {
+                    filtered.push(area);
+                    continue;
+                }
+                if area.offset < hole_start {
+                    filtered.push(VfioRegionSparseMmapArea {
+                        offset: area.offset,
+                        size: hole_start - area.offset,
+                    });
+                }
+                if end > hole_end {
+                    filtered.push(VfioRegionSparseMmapArea {
+                        offset: hole_end,
+                        size: end - hole_end,
+                    });
+                }
+            }
+            areas = filtered;
+        }
+        Ok(areas)
+    }
+
     fn generate_sparse_areas(
         caps: &[VfioRegionInfoCap],
         region_index: u32,
         region_start: u64,
         region_size: u64,
-        vfio_msix: Option<&VfioMsix>,
+        vfio_msix: Option<&MsixCap>,
     ) -> Result<Vec<VfioRegionSparseMmapArea>, VfioPciError> {
-        for cap in caps {
-            match cap {
-                VfioRegionInfoCap::SparseMmap(sparse_mmap) => return Ok(sparse_mmap.areas.clone()),
-                VfioRegionInfoCap::MsixMappable => {
-                    if !is_4k_aligned(region_start) {
-                        error!(
-                            "Region start address 0x{region_start:x} must be at least aligned on 4KiB"
-                        );
-                        return Err(VfioPciError::RegionAlignment);
-                    }
-                    if !is_4k_multiple(region_size) {
-                        error!("Region size 0x{region_size:x} must be at least a multiple of 4KiB");
-                        return Err(VfioPciError::RegionSize);
-                    }
-
-                    // In case the region contains the MSI-X vectors table or
-                    // the MSI-X PBA table, we must calculate the subregions
-                    // around them, leading to a list of sparse areas.
-                    // We want to make sure we will still trap MMIO accesses
-                    // to these MSI-X specific ranges. If these region don't align
-                    // with pagesize, we can achieve it by enlarging its range.
-                    //
-                    // Using a BtreeMap as the list provided through the iterator is sorted
-                    // by key. This ensures proper split of the whole region.
-                    let mut inter_ranges = BTreeMap::new();
-                    if let Some(msix) = vfio_msix {
-                        if region_index == msix.cap.table_bir() {
-                            let (offset, size) = msix.cap.table_range();
-                            let offset = align_page_size_down(offset);
-                            let size = align_page_size_up(size);
-                            // MSI-X mmap region safety: when a device has a non page
-                            // aligned MSI-X offset, fixup_msix_region() relocates MSI-X
-                            // to the upper half of an enlarged virtual BAR, causing the
-                            // offsets in msix.cap to exceed the physical BAR size. This
-                            // check skips carving a hole, preventing invalid offsets from
-                            // reaching the mmap path. With no holes,
-                            // generate_sparse_areas() returns a single sparse region
-                            // covering the entire physical BAR. The relocated MSI-X in
-                            // the virtual BAR remains trapped because its upper half has
-                            // no mmap backing. Exposing the physical MSI-X region through
-                            // mmap is safe when the kernel advertises
-                            // VFIO_REGION_INFO_CAP_MSIX_MAPPABLE. When MSI-X offsets are
-                            // already page aligned, fixup_msix_region() does not relocate
-                            // and this check is satisfied, so a hole is carved at the
-                            // intended offset as before.
-                            if offset < region_size {
-                                inter_ranges.insert(offset, size);
-                            }
-                        }
-                        if region_index == msix.cap.pba_bir() {
-                            let (offset, size) = msix.cap.pba_range();
-                            let offset = align_page_size_down(offset);
-                            let size = align_page_size_up(size);
-                            // See MSI-X mmap safety comment above.
-                            if offset < region_size {
-                                inter_ranges.insert(offset, size);
-                            }
-                        }
-                    }
-
-                    let mut sparse_areas = Vec::new();
-                    let mut current_offset = 0;
-                    for (range_offset, range_size) in inter_ranges {
-                        if range_offset > current_offset {
-                            sparse_areas.push(VfioRegionSparseMmapArea {
-                                offset: current_offset,
-                                size: range_offset - current_offset,
-                            });
-                        }
-                        current_offset = align_page_size_down(range_offset + range_size);
-                    }
-
-                    if region_size > current_offset {
-                        sparse_areas.push(VfioRegionSparseMmapArea {
-                            offset: current_offset,
-                            size: region_size - current_offset,
-                        });
-                    }
-
-                    return Ok(sparse_areas);
-                }
-                _ => {}
+        if let Some(sparse) = caps.iter().find_map(|cap| match cap {
+            VfioRegionInfoCap::SparseMmap(sparse) => Some(sparse),
+            _ => None,
+        }) {
+            return Ok(sparse.areas.clone());
+        }
+        if caps.contains(&VfioRegionInfoCap::MsixMappable) {
+            if !is_4k_aligned(region_start) {
+                error!("Region start address 0x{region_start:x} must be at least aligned on 4KiB");
+                return Err(VfioPciError::RegionAlignment);
+            }
+            if !is_4k_multiple(region_size) {
+                error!("Region size 0x{region_size:x} must be at least a multiple of 4KiB");
+                return Err(VfioPciError::RegionSize);
+            }
+            if let Some(msix) = vfio_msix {
+                return Self::sparse_areas_without_msix(
+                    &[VfioRegionSparseMmapArea {
+                        offset: 0,
+                        size: region_size,
+                    }],
+                    region_index,
+                    msix,
+                );
             }
         }
 
@@ -2278,12 +2282,14 @@ impl VfioPciDevice {
                     Vec::new()
                 };
 
-                // Don't try to mmap the region if it contains MSI-X table or
-                // MSI-X PBA subregion, and if we couldn't find MSIX_MAPPABLE
-                // in the list of supported capabilities.
+                // Keep MSI-X accesses trapped. Sparse mappings can still expose
+                // safe parts of a BAR without making its MSI-X tables mappable.
                 if let Some(msix) = self.common.interrupt.msix.as_ref()
                     && (region.index == msix.cap.table_bir() || region.index == msix.cap.pba_bir())
                     && !caps.contains(&VfioRegionInfoCap::MsixMappable)
+                    && !caps
+                        .iter()
+                        .any(|cap| matches!(cap, VfioRegionInfoCap::SparseMmap(_)))
                 {
                     continue;
                 }
@@ -2296,7 +2302,7 @@ impl VfioPciDevice {
                     region.index,
                     region.start.0,
                     mmap_size,
-                    self.common.interrupt.msix.as_ref(),
+                    self.common.interrupt.msix.as_ref().map(|msix| &msix.cap),
                 )?;
 
                 let page_size = get_page_size();
@@ -2350,46 +2356,68 @@ impl VfioPciDevice {
                         }
                     };
 
-                    let user_memory_region = UserMemoryRegion {
-                        slot: self.memory_slot_allocator.next_memory_slot(),
-                        start: region.start.0 + area.offset,
-                        mapping: Arc::new(mapping),
+                    let mapping = Arc::new(mapping);
+                    let mapped_area = VfioRegionSparseMmapArea {
+                        offset: area.offset,
+                        size: mmap_len,
                     };
-                    // SAFETY: MmapRegion invariants guarantee that
-                    // user_memory_region.mapping.addr() points to
-                    // user_memory_region.mapping.len() bytes of
-                    // valid memory that will only be unmapped with munmap().
-                    unsafe {
-                        self.vm.create_user_memory_region(
-                            user_memory_region.slot,
-                            user_memory_region.start,
-                            user_memory_region.mapping.len(),
-                            user_memory_region.mapping.addr(),
-                            false,
-                            false,
-                            hypervisor::MemoryVisibility::Shared,
-                        )
-                    }
-                    .map_err(VfioPciError::CreateUserMemoryRegion)?;
-
-                    // Map the MMIO BAR into the host IOMMU address space via VfioOps
-                    // Only needed if p2p_dma is enabled.
-                    if self.p2p_dma {
-                        // vfio_dma_map should be unsafe but isn't.
+                    let guest_areas = match self.common.interrupt.msix.as_ref() {
+                        Some(msix) => Self::sparse_areas_without_msix(
+                            slice::from_ref(&mapped_area),
+                            region.index,
+                            &msix.cap,
+                        )?,
+                        None => vec![mapped_area],
+                    };
+                    for guest_area in guest_areas {
+                        let user_memory_region = UserMemoryRegion {
+                            slot: self.memory_slot_allocator.next_memory_slot(),
+                            start: region.start.0 + guest_area.offset,
+                            mapping: MmapRegionSlice::new(
+                                Arc::clone(&mapping),
+                                guest_area.offset - area.offset,
+                                guest_area.size,
+                            )
+                            .map_err(|_| VfioPciError::MmapArea)?,
+                        };
                         // SAFETY: MmapRegion invariants guarantee that
                         // user_memory_region.mapping.addr() points to
                         // user_memory_region.mapping.len() bytes of
                         // valid memory that will only be unmapped with munmap().
                         unsafe {
-                            self.vfio_ops.vfio_dma_map(
+                            self.vm.create_user_memory_region(
+                                user_memory_region.slot,
                                 user_memory_region.start,
                                 user_memory_region.mapping.len(),
                                 user_memory_region.mapping.addr(),
+                                false,
+                                false,
+                                hypervisor::MemoryVisibility::Shared,
                             )
                         }
-                        .map_err(|e| VfioPciError::DmaMap(e, self.device_path.clone(), self.bdf))?;
+                        .map_err(VfioPciError::CreateUserMemoryRegion)?;
+
+                        // Map the MMIO BAR into the host IOMMU address space via VfioOps
+                        // Only needed if p2p_dma is enabled.
+                        if self.p2p_dma {
+                            // vfio_dma_map should be unsafe but isn't.
+                            // SAFETY: MmapRegion invariants guarantee that
+                            // user_memory_region.mapping.addr() points to
+                            // user_memory_region.mapping.len() bytes of
+                            // valid memory that will only be unmapped with munmap().
+                            unsafe {
+                                self.vfio_ops.vfio_dma_map(
+                                    user_memory_region.start,
+                                    user_memory_region.mapping.len(),
+                                    user_memory_region.mapping.addr(),
+                                )
+                            }
+                            .map_err(|e| {
+                                VfioPciError::DmaMap(e, self.device_path.clone(), self.bdf)
+                            })?;
+                        }
+                        region.user_memory_regions.push(user_memory_region);
                     }
-                    region.user_memory_regions.push(user_memory_region);
                 }
             }
         }
@@ -2839,6 +2867,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::env::temp_dir;
+    use std::iter;
     use std::os::fd::AsFd;
     use std::sync::Mutex;
 
@@ -2883,12 +2912,12 @@ mod tests {
                 UserMemoryRegion {
                     slot: 0,
                     start: page_size,
-                    mapping: mapping_a,
+                    mapping: mapping_a.into(),
                 },
                 UserMemoryRegion {
                     slot: 1,
                     start: 3 * page_size,
-                    mapping: mapping_b,
+                    mapping: mapping_b.into(),
                 },
             ],
         }]
@@ -3167,6 +3196,167 @@ mod tests {
             migration_flags,
             dma_logging_page_size: None,
             extended_caps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sparse_mmap_keeps_msix_table_and_pba_trapped() {
+        let page = get_page_size();
+        let msix = MsixCap::new(
+            0,
+            3,
+            (16 * page).try_into().unwrap(),
+            0,
+            (32 * page).try_into().unwrap(),
+        );
+        let sparse = VfioRegionInfoCap::SparseMmap(vfio_ioctls::VfioRegionInfoCapSparseMmap {
+            areas: vec![
+                VfioRegionSparseMmapArea {
+                    offset: 0,
+                    size: 3 * page,
+                },
+                VfioRegionSparseMmapArea {
+                    offset: 4 * page,
+                    size: 12 * page,
+                },
+                VfioRegionSparseMmapArea {
+                    offset: 17 * page,
+                    size: 47 * page,
+                },
+            ],
+        });
+        for caps in [
+            vec![sparse.clone()],
+            vec![VfioRegionInfoCap::MsixMappable, sparse.clone()],
+        ] {
+            let areas =
+                VfioPciDevice::generate_sparse_areas(&caps, 0, 0xc000_0000, 64 * page, Some(&msix))
+                    .unwrap();
+            assert_eq!(areas.len(), 3);
+            assert_eq!(areas[2].size, 47 * page);
+            let guest_areas = VfioPciDevice::sparse_areas_without_msix(&areas, 0, &msix).unwrap();
+            let guest_areas: Vec<_> = guest_areas
+                .iter()
+                .map(|area| (area.offset, area.size))
+                .collect();
+            assert_eq!(
+                guest_areas,
+                vec![
+                    (0, 3 * page),
+                    (4 * page, 12 * page),
+                    (17 * page, 15 * page),
+                    (33 * page, 31 * page),
+                ]
+            );
+            let other_bar =
+                VfioPciDevice::generate_sparse_areas(&caps, 1, 0xc000_0000, 64 * page, Some(&msix))
+                    .unwrap();
+            assert_eq!(other_bar.len(), 3);
+        }
+        let invalid = [VfioRegionSparseMmapArea {
+            offset: u64::MAX - 1,
+            size: 4,
+        }];
+        assert!(matches!(
+            VfioPciDevice::sparse_areas_without_msix(&invalid, 0, &msix),
+            Err(VfioPciError::MmapArea)
+        ));
+    }
+
+    struct BarProbeVfio {
+        registers: Mutex<[u32; 16]>,
+        size_masks: [u32; 16],
+    }
+
+    impl BarProbeVfio {
+        fn new() -> Arc<Self> {
+            let mut registers = [0; 16];
+            let mut size_masks = [0; 16];
+            registers[4] = 0xc000_0000;
+            size_masks[4] = 0xff00_0000;
+            registers[5] = 0x0000_000c;
+            size_masks[5] = 0xf000_000c;
+            registers[6] = 0x0000_0004;
+            size_masks[6] = 0xffff_ffff;
+            registers[7] = 0x0000_d001;
+            size_masks[7] = 0xffff_ff01;
+            registers[12] = 0xc100_0001;
+            size_masks[12] = 0xfffe_0001;
+            Arc::new(Self {
+                registers: Mutex::new(registers),
+                size_masks,
+            })
+        }
+    }
+
+    impl Vfio for BarProbeVfio {
+        fn read_config_dword(&self, offset: u32) -> u32 {
+            let index = offset as usize / 4;
+            let value = self.registers.lock().unwrap()[index];
+            if value == u32::MAX {
+                self.size_masks[index]
+            } else {
+                value
+            }
+        }
+
+        fn write_config_dword(&self, offset: u32, value: u32) {
+            self.registers.lock().unwrap()[offset as usize / 4] = value;
+        }
+
+        fn write_config(&self, offset: u32, data: &[u8]) {
+            let mut registers = self.registers.lock().unwrap();
+            let index = offset as usize / 4;
+            let start = offset as usize % 4;
+            let mut bytes = registers[index].to_le_bytes();
+            bytes[start..start + data.len()].copy_from_slice(data);
+            registers[index] = u32::from_le_bytes(bytes);
+        }
+    }
+
+    #[test]
+    fn bar_configuration_is_synchronized_with_vfio() {
+        for mmio32_size in [0x1000, 0x4000_0000] {
+            let vfio = BarProbeVfio::new();
+            let original = *vfio.registers.lock().unwrap();
+            let mut common = test_vfio_common(Arc::clone(&vfio), None);
+            let mut allocator = SystemAllocator::new(
+                GuestAddress(0x1000),
+                0xf000,
+                GuestAddress(0x8000_0000),
+                0x1000_0000,
+                #[cfg(target_arch = "x86_64")]
+                &[vm_allocator::GsiApic::new(5, 19)],
+            )
+            .unwrap();
+            let mut mmio32 = AddressAllocator::new(GuestAddress(0x1000_0000), mmio32_size).unwrap();
+            let mut mmio64 =
+                AddressAllocator::new(GuestAddress(0x1_0000_0000), 0x1_0000_0000).unwrap();
+            let bars = common.allocate_bars(&mut allocator, &mut mmio32, &mut mmio64, None);
+            if mmio32_size == 0x1000 {
+                assert!(matches!(bars, Err(PciDeviceError::IoAllocationFailed(_))));
+                assert_eq!(*vfio.registers.lock().unwrap(), original);
+            } else {
+                let bars = bars.unwrap();
+                assert_eq!(bars.len(), 4);
+                assert_eq!(bars[0].size(), 0x100_0000);
+                assert_eq!(bars[1].size(), 0x1000_0000);
+                assert_eq!(bars[2].size(), 0x100);
+                assert_eq!(bars[3].size(), 0x2_0000);
+                for reg in (4..10).chain(iter::once(12)) {
+                    assert_eq!(
+                        vfio.registers.lock().unwrap()[reg],
+                        common.configuration.read_reg(reg)
+                    );
+                }
+                let address: u32 = 0xd000_0000;
+                common.write_config_register(4, 0, &address.to_le_bytes());
+                assert_eq!(vfio.registers.lock().unwrap()[4], address);
+                assert_eq!(common.configuration.read_reg(4), address);
+                common.write_config_register(4, 2, &0xe000u16.to_le_bytes());
+                assert_eq!(vfio.registers.lock().unwrap()[4], 0xe000_0000);
+                assert_eq!(common.configuration.read_reg(4), 0xe000_0000);
+            }
         }
     }
 
